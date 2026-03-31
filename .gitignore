@@ -5,3 +5,5 @@
 *.pth
 *.pt
 *.dat
+datasets/rgb/
+datasets/lmdb/
