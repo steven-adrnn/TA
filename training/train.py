@@ -1,3 +1,4 @@
+# train.py
 # author: Zhiyuan Yan
 # email: zhiyuanyan@link.cuhk.edu.cn
 # date: 2023-03-30
@@ -34,6 +35,8 @@ from detectors import DETECTOR
 from dataset import *
 from metrics.utils import parse_metric_for_print
 from logger import create_logger, RankFilter
+from dataset.balanced_sampler import DemographicBalancedSampler  # ← tambah import ini di atas
+from torch.cuda.amp import GradScaler
 
 
 parser = argparse.ArgumentParser(description='Process some paths.')
@@ -47,6 +50,7 @@ parser.add_argument('--no-save_feat', dest='save_feat', action='store_false', de
 parser.add_argument("--ddp", action='store_true', default=False)
 parser.add_argument('--local_rank', type=int, default=0)
 parser.add_argument('--task_target', type=str, default="", help='specify the target of current training task')
+parser.add_argument('--weights_path', type=str, default=None, help='path to resume checkpoint')
 args = parser.parse_args()
 torch.cuda.set_device(args.local_rank)
 
@@ -110,17 +114,71 @@ def prepare_training_data(config):
                 sampler=sampler
             )
     else:
-        train_data_loader = \
-            torch.utils.data.DataLoader(
+        use_balanced_sampler = config.get('use_balanced_sampler', False)
+        if use_balanced_sampler:
+            sampler = DemographicBalancedSampler(
+                dataset=train_set,
+                batch_size=config['train_batchSize'],
+                num_demographics=config['backbone_config'].get('num_demographics', 13)
+            )
+            train_data_loader = torch.utils.data.DataLoader(
+                dataset=train_set,
+                batch_size=config['train_batchSize'],
+                sampler=sampler,
+                num_workers=int(config['workers']),
+                collate_fn=train_set.collate_fn,
+                drop_last=True,
+            )
+            print(f"[INFO] Menggunakan DemographicBalancedSampler")
+        else:
+            train_data_loader = torch.utils.data.DataLoader(
                 dataset=train_set,
                 batch_size=config['train_batchSize'],
                 shuffle=True,
                 num_workers=int(config['workers']),
                 collate_fn=train_set.collate_fn,
-                )
+            )
     return train_data_loader
 
+def prepare_training_data_with_compression(config, compressions):
+    """Buat dataloader baru dengan kompresi tertentu."""
+    config_copy = config.copy()
+    config_copy['compressions'] = compressions
 
+    if 'dataset_type' in config_copy and config_copy['dataset_type'] == 'blend':
+        raise NotImplementedError('Curriculum tidak support blend dataset')
+    else:
+        train_set = DeepfakeAbstractBaseDataset(
+            config=config_copy,
+            mode='train',
+        )
+
+    use_balanced_sampler = config_copy.get('use_balanced_sampler', False)
+    if use_balanced_sampler:
+        sampler = DemographicBalancedSampler(
+            dataset=train_set,
+            batch_size=config_copy['train_batchSize'],
+            num_demographics=config_copy['backbone_config'].get('num_demographics', 13)
+        )
+        loader = torch.utils.data.DataLoader(
+            dataset=train_set,
+            batch_size=config_copy['train_batchSize'],
+            sampler=sampler,
+            num_workers=int(config_copy['workers']),
+            collate_fn=train_set.collate_fn,
+            drop_last=True,
+        )
+    else:
+        loader = torch.utils.data.DataLoader(
+            dataset=train_set,
+            batch_size=config_copy['train_batchSize'],
+            shuffle=True,
+            num_workers=int(config_copy['workers']),
+            collate_fn=train_set.collate_fn,
+        )
+
+    return loader
+    
 def prepare_testing_data(config):
     def get_test_data_loader(config, test_name):
         # update the config dictionary with the specific testing dataset
@@ -142,7 +200,7 @@ def prepare_testing_data(config):
                 dataset=test_set,
                 batch_size=config['test_batchSize'],
                 shuffle=False,
-                num_workers=int(config['workers']),
+                num_workers=min(int(config['workers']), 4),
                 collate_fn=test_set.collate_fn,
                 drop_last = (test_name=='DeepFakeDetection'),
             )
@@ -157,18 +215,42 @@ def prepare_testing_data(config):
 
 def choose_optimizer(model, config):
     opt_name = config['optimizer']['type']
+    backbone_params = []
+    head_params = []
+
+    for name, param in model.named_parameters():
+        # Jika model fair_cross_domain, layer Xception ada di 'spatial_branch'
+        if 'spatial_branch' in name:
+            backbone_params.append(param)
+        # Jika menjalankan xception murni, semua layer kecuali 'last_linear' adalah backbone
+        elif config['model_name'] == 'xception' and 'last_linear' not in name:
+            backbone_params.append(param)
+        # Sisa modul (LSTM, Attention, Freq, Audio, Heads) masuk ke head
+        else:
+            head_params.append(param)
+
+    # --- 2. ATUR LEARNING RATE ---
+    # Ambil base LR dari config (yaml)
+    base_lr = config['optimizer'][opt_name]['lr']
+    # Backbone LR dibuat 10x lebih kecil agar bobot pretrained tidak hancur
+    backbone_lr = base_lr / 10.0 
+
+    # --- 3. BUAT PARAMETER GROUPS ---
+    param_groups = [
+        {'params': backbone_params, 'lr': backbone_lr},
+        {'params': head_params, 'lr': base_lr}
+    ]
+
     if opt_name == 'sgd':
         optimizer = optim.SGD(
-            params=model.parameters(),
-            lr=config['optimizer'][opt_name]['lr'],
+            params=param_groups,
             momentum=config['optimizer'][opt_name]['momentum'],
             weight_decay=config['optimizer'][opt_name]['weight_decay']
         )
         return optimizer
     elif opt_name == 'adam':
         optimizer = optim.Adam(
-            params=model.parameters(),
-            lr=config['optimizer'][opt_name]['lr'],
+            params=param_groups,
             weight_decay=config['optimizer'][opt_name]['weight_decay'],
             betas=(config['optimizer'][opt_name]['beta1'], config['optimizer'][opt_name]['beta2']),
             eps=config['optimizer'][opt_name]['eps'],
@@ -177,11 +259,11 @@ def choose_optimizer(model, config):
         return optimizer
     elif opt_name == 'sam':
         optimizer = SAM(
-            model.parameters(), 
-            optim.SGD, 
-            lr=config['optimizer'][opt_name]['lr'],
+            param_groups, 
+            base_optimizer=optim.SGD,
             momentum=config['optimizer'][opt_name]['momentum'],
         )
+        return optimizer
     else:
         raise NotImplementedError('Optimizer {} is not implemented'.format(config['optimizer']))
     return optimizer
@@ -242,7 +324,7 @@ def main():
     config['save_ckpt'] = args.save_ckpt
     config['save_feat'] = args.save_feat
     if config['lmdb']:
-        config['dataset_json_folder'] = 'preprocessing/dataset_json_v3'
+        config['dataset_json_folder'] = 'preprocessing/dataset_json'
     # create logger
     timenow=datetime.datetime.now().strftime('%Y-%m-%d-%H-%M-%S')
     task_str = f"_{config['task_target']}" if config.get('task_target', None) is not None else ""
@@ -274,8 +356,48 @@ def main():
             timeout=timedelta(minutes=30)
         )
         logger.addFilter(RankFilter(0))
+        
     # prepare the training data loader
-    train_data_loader = prepare_training_data(config)
+    two_stage_config = config.get('two_stage', {})
+    use_two_stage    = two_stage_config.get('enabled', False)
+    stage1_epochs    = two_stage_config.get('stage1_epochs', 15)
+ 
+    if use_two_stage:
+        # Stage 1: frame-level — batch lebih besar karena tidak pakai clip
+        stage1_data_config = config.copy()
+        stage1_data_config['video_mode']       = False
+        stage1_data_config['clip_size']         = None
+        stage1_data_config['frame_num']         = {'train': 8, 'test': 8}
+        stage1_data_config['train_batchSize']   = two_stage_config.get('stage1_batch', 28)
+        # Stage 1 tidak butuh balanced sampler — lebih cepat
+        stage1_data_config['use_balanced_sampler'] = False
+ 
+        # Stage 2: video-level — pakai config YAML asli
+        stage2_data_config = config.copy()
+        # stage2 pakai video_mode, clip_size, frame_num, batchSize dari YAML asli
+ 
+        logger.info(f"[TwoStage] AKTIF — Stage 1: frame-level, batch={stage1_data_config['train_batchSize']}, epoch 0 s/d {stage1_epochs-1}")
+        logger.info(f"[TwoStage] Stage 2: video-level, batch={stage2_data_config['train_batchSize']}, epoch {stage1_epochs}+")
+ 
+        train_data_loader    = prepare_training_data(stage1_data_config)
+        current_train_stage  = 1
+    else:
+        # Two-stage tidak aktif
+        curriculum_config = config.get('curriculum', {})
+        use_curriculum    = curriculum_config.get('enabled', False)
+ 
+        if use_curriculum:
+            switch_epoch = curriculum_config.get('switch_epoch', 25)
+            high_quality = curriculum_config.get('high_quality', ['720p', 'c23'])
+            all_quality  = curriculum_config.get('all_quality', ['720p', '144p', 'c23', 'c40'])
+            logger.info(f"[Curriculum] AKTIF — kompresi: {high_quality} (s/d epoch {switch_epoch-1})")
+            train_data_loader = prepare_training_data_with_compression(config, high_quality)
+            current_stage     = 'high'
+        else:
+            train_data_loader = prepare_training_data(config)
+            current_stage     = None
+ 
+        current_train_stage = None   # two-stage tidak aktif
 
     # prepare the testing data loader
     test_data_loaders = prepare_testing_data(config)
@@ -296,17 +418,53 @@ def main():
     # prepare the trainer
     trainer = Trainer(config, model, optimizer, scheduler, logger, metric_scoring, time_now=timenow)
 
+    if args.weights_path:
+        trainer.load_ckpt(args.weights_path)
+        logger.info(f"===> Berhasil memuat bobot dari: {args.weights_path}")
+        
     # start training
-    for epoch in range(config['start_epoch'], config['nEpochs'] + 1):
+    start_epoch = trainer.load_resume_ckpt()
+
+    for epoch in range(start_epoch, config['nEpochs']):
+
+        # ── Two-Stage switch ─────────────────────────────────────────
+        if use_two_stage and current_train_stage == 1 and epoch >= stage1_epochs:
+            logger.info(
+                f"[TwoStage] Epoch {epoch}: SWITCH ke Stage 2 — video-level, "
+                f"batch={stage2_data_config['train_batchSize']}"
+            )
+            train_data_loader   = prepare_training_data(stage2_data_config)
+            current_train_stage = 2
+            trainer.scaler = GradScaler(init_scale=256.0)  # mulai dari scale kecil
+            logger.info("[TwoStage] GradScaler di-reset untuk stage 2")
+            logger.info(
+                f"[TwoStage] DataLoader Stage 2 siap: "
+                f"{len(train_data_loader.dataset)} sampel total"
+            )
+ 
+        # ── Curriculum switch ───────────────
+        elif not use_two_stage and use_curriculum:
+            if current_stage == 'high' and epoch >= switch_epoch:
+                logger.info(f"[Curriculum] Epoch {epoch}: SWITCH ke Stage 2 — {all_quality}")
+                train_data_loader = prepare_training_data_with_compression(config, all_quality)
+                current_stage     = 'all'
+
         trainer.model.epoch = epoch
         best_metric = trainer.train_epoch(
-                    epoch=epoch,
-                    train_data_loader=train_data_loader,
-                    test_data_loaders=test_data_loaders,
-                )
+            epoch=epoch,
+            train_data_loader=train_data_loader,
+            test_data_loaders=test_data_loaders,
+        )
+
+        torch.cuda.empty_cache()
         if best_metric is not None:
-            logger.info(f"===> Epoch[{epoch}] end with testing {metric_scoring}: {parse_metric_for_print(best_metric)}!")
-    logger.info("Stop Training on best Testing metric {}".format(parse_metric_for_print(best_metric))) 
+            logger.info(
+                f"===> Epoch[{epoch}] end with testing "
+                f"{metric_scoring}: {parse_metric_for_print(best_metric)}!"
+            )
+
+    logger.info("Stop Training on best Testing metric {}".format(parse_metric_for_print(best_metric)))
+
     # update
     if 'svdd' in config['model_name']:
         model.update_R(epoch)

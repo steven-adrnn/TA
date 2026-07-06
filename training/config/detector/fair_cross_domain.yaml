@@ -1,0 +1,93 @@
+# fair_cross_domain.yaml
+# log dir 
+resume_dir: ""
+log_dir: ./logs/training/fair_cross_domain
+
+# model setting
+model_name: fair_cross_domain_detector
+backbone_name: fair_cross_domain
+
+# backbone setting
+backbone_config:
+  mode: original
+  num_classes: 2
+  num_demographics: 13
+  inc: 3
+  dropout: false
+
+# fairness loss weights
+weight_adv: 0.2
+weight_daw: 0.2
+weight_cvar: 0.2
+weight_freq: 0.3 
+
+# dataset
+all_dataset: [FaceForensics++, FF-F2F, FF-DF, FF-FS, FF-NT, FF-FH, FaceShifter, DeepFakeDetection, Celeb-DF-v1, Celeb-DF-v2, DFDCP, DFDC, DeeperForensics-1.0, UADFV, IndoDeepfake, Indo-MM, Indo-FS, Indo-VC, TA-FS, TA-VC, TA-MM]
+train_dataset: [Indo-MM, Indo-FS, Indo-VC, FF-F2F, FF-DF, FF-FS, FF-NT, FF-FH]
+test_dataset: [Indo-MM, Indo-FS, Indo-VC]
+
+compressions: ['720p']
+use_balanced_sampler: true
+train_batchSize: 16
+test_batchSize: 32
+workers: 8
+frame_num: {'train': 24, 'test': 24}  # [B, T, C, H, W] dengan T=32
+resolution: 256
+with_audio: true
+audio_config:
+  sample_rate: 16000
+  n_mels: 128
+  target_length: 256
+  gate_threshold: 0.2
+with_mask: false
+with_landmark: false
+video_mode: true   # Penting untuk Temporal Branch (mengirim input T dimension)
+clip_size: 8
+
+use_data_augmentation: true
+data_aug:
+  flip_prob: 0.5
+  rotate_prob: 0.0
+  rotate_limit: [-10, 10]
+  blur_prob: 0.5
+  blur_limit: [3, 7]
+  brightness_prob: 0.5
+  brightness_limit: [-0.1, 0.1]
+  contrast_limit: [-0.1, 0.1]
+  quality_lower: 15
+  quality_upper: 95
+
+mean: [0.5, 0.5, 0.5]
+std: [0.5, 0.5, 0.5]
+
+optimizer:
+  type: adam
+  adam:
+    lr: 0.0001
+    beta1: 0.9
+    beta2: 0.999
+    eps: 0.00000001
+    weight_decay: 0.0005
+    amsgrad: false
+
+lr_scheduler: cosine
+lr_T_max: 40
+lr_eta_min: 0.000005
+lr_step: 10
+lr_gamma: 0.5
+nEpochs: 100
+start_epoch: 0
+save_epoch: 1
+manualSeed: 1024
+save_ckpt: true
+
+two_stage:
+  enabled: true
+  stage1_epochs: 20      # epoch 0-19 = stage 1 (frame-level)
+  stage1_batch: 16
+
+loss_func: cross_entropy
+metric_scoring: auc
+
+cuda: true
+cudnn: true

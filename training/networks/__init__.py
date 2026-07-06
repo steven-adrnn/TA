@@ -13,3 +13,4 @@ from .mesonet import Meso4, MesoInception4
 from .resnet34 import ResNet34
 from .efficientnetb4 import EfficientNetB4
 from .xception_sladd import Xception_SLADD
+from .fair_cross_domain import FairCrossDomainNet

@@ -37,6 +37,12 @@ def calculate_metrics_for_train(label, output):
     y_pred = prob.cpu().detach().numpy()
     ap = metrics.average_precision_score(y_true, y_pred)
 
+    # F1-Score
+    y_true_clip = np.clip(y_true, a_min=0, a_max=1)
+    prediction_class = prediction.cpu().detach().numpy()
+    f1 = metrics.f1_score(y_true_clip, prediction_class, zero_division=0)
+
+
     # AUC and EER
     try:
         fpr, tpr, thresholds = metrics.roc_curve(label.squeeze().cpu().numpy(),
@@ -54,7 +60,7 @@ def calculate_metrics_for_train(label, output):
         fnr = 1 - tpr
         eer = fpr[np.nanargmin(np.absolute((fnr - fpr)))]
 
-    return auc, eer, accuracy, ap
+    return auc, eer, accuracy, ap, f1
 
 
 # ------------ compute average metrics of batches---------------------
@@ -171,14 +177,31 @@ class Metrics_all():
         # auc
         fpr, tpr, thresholds = metrics.roc_curve(y_true,y_pred,pos_label=1)
         auc = metrics.auc(fpr, tpr)
-        # eer
+        # # eer
         fnr = 1 - tpr
         eer = fpr[np.nanargmin(np.absolute((fnr - fpr)))]
-        # ap
+        # # ap
+
         ap = metrics.average_precision_score(y_true,y_pred)
+        youden_j = tpr - fpr
+        
+        # 2. Cari index di mana Youden's J paling besar (maksimal)
+        optimal_idx = np.argmax(youden_j)
+        
+        # 3. Ambil nilai threshold pada index tersebut
+        optimal_threshold = thresholds[optimal_idx]
+        
+        # 4. Gunakan optimal_threshold untuk memprediksi kelas (bukan lagi > 0.5)
+        prediction_class = (y_pred >= optimal_threshold).astype(int)
+        
+        y_true_clip = np.clip(y_true, a_min=0, a_max=1)
+        correct = (prediction_class == y_true_clip).sum().item()
+        acc = correct / len(prediction_class)
+        f1 = metrics.f1_score(y_true_clip, prediction_class, zero_division=0)
+        print(f"Optimal Threshold: {optimal_threshold:.4f} | New Accuracy: {acc:.4f}")
         # acc
-        acc = self.correct / self.total
-        return {'acc':acc, 'auc':auc, 'eer':eer, 'ap':ap}
+        # acc = self.correct / self.total
+        return {'acc':acc, 'auc':auc, 'eer':eer, 'ap':ap, 'f1':f1}
 
     def clear(self):
         self.probs.clear()

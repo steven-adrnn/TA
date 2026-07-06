@@ -1,3 +1,4 @@
+# abstract_dataset
 # author: Zhiyuan Yan
 # email: zhiyuanyan@link.cuhk.edu.cn
 # date: 2023-03-30
@@ -23,6 +24,8 @@ from PIL import Image
 from collections import defaultdict
 
 import torch
+import torchaudio
+import torchaudio.transforms as TA_transforms
 from torch.autograd import Variable
 from torch.utils import data
 from torchvision import transforms as T
@@ -31,8 +34,17 @@ import albumentations as A
 
 from .albu import IsotropicResize
 
-FFpp_pool=['FaceForensics++','FaceShifter','DeepFakeDetection','FF-DF','FF-F2F','FF-FS','FF-NT']#
+SUKU_DICT = {
+    'BAL': 0, 'BJR': 1, 'BTK': 2, 'BUG': 3, 'CIN': 4,
+    'DYK': 5, 'JAW': 6, 'MKS': 7, 'MLK': 8, 'MIN': 9,
+    'PAP': 10, 'SSK': 11, 'SUN': 12,
+    'NON_INDO': 13
+}
 
+SUKU_LIST = list(SUKU_DICT.keys())
+
+GLOBAL_LMDB_ENVS = {}
+FFpp_pool=['FaceForensics++','FaceShifter','DeepFakeDetection','FF-DF','FF-F2F','FF-FS','FF-NT', 'FF-FH', 'IndoDeepfake', 'Indo-MM', 'Indo-FS', 'Indo-VC']
 def all_in_pool(inputs,pool):
     for each in inputs:
         if each not in pool:
@@ -45,6 +57,7 @@ class DeepfakeAbstractBaseDataset(data.Dataset):
     Abstract base class for all deepfake datasets.
     """
     def __init__(self, config=None, mode='train'):
+        global GLOBAL_LMDB_ENVS
         """Initializes the dataset object.
 
         Args:
@@ -58,8 +71,10 @@ class DeepfakeAbstractBaseDataset(data.Dataset):
         # Set the configuration and mode
         self.config = config
         self.mode = mode
-        self.compression = config['compression']
+        self.compression = config['compressions']
         self.frame_num = config['frame_num'][mode]
+        
+        self._init_indo_demographic_mapping()
 
         # Check if 'video_mode' exists in config, otherwise set video_level to False
         self.video_level = config.get('video_mode', False)
@@ -82,19 +97,27 @@ class DeepfakeAbstractBaseDataset(data.Dataset):
                 if len(dataset_list)>1:
                     if all_in_pool(dataset_list,FFpp_pool):
                         lmdb_path = os.path.join(config['lmdb_dir'], f"FaceForensics++_lmdb")
-                        self.env = lmdb.open(lmdb_path, create=False, subdir=True, readonly=True, lock=False)
+                        # self.env = lmdb.open(lmdb_path, create=False, subdir=True, readonly=True, lock=False)
+                        if lmdb_path not in GLOBAL_LMDB_ENVS:
+                            GLOBAL_LMDB_ENVS[lmdb_path] = lmdb.open(lmdb_path, create=False, subdir=True, readonly=True, lock=False)
+                        self.env = GLOBAL_LMDB_ENVS[lmdb_path]
                     else:
                         raise ValueError('Training with multiple dataset and lmdb is not implemented yet.')
                 else:
                     lmdb_path = os.path.join(config['lmdb_dir'], f"{dataset_list[0] if dataset_list[0] not in FFpp_pool else 'FaceForensics++'}_lmdb")
-                    self.env = lmdb.open(lmdb_path, create=False, subdir=True, readonly=True, lock=False)
+                    if lmdb_path not in GLOBAL_LMDB_ENVS:
+                        GLOBAL_LMDB_ENVS[lmdb_path] = lmdb.open(lmdb_path, create=False, subdir=True, readonly=True, lock=False)
+                    self.env = GLOBAL_LMDB_ENVS[lmdb_path]
         elif mode == 'test':
             one_data = config['test_dataset']
             # Test dataset should be evaluated separately. So collect only one dataset each time
             image_list, label_list, name_list = self.collect_img_and_label_for_one_dataset(one_data)
             if self.lmdb:
                 lmdb_path = os.path.join(config['lmdb_dir'], f"{one_data}_lmdb" if one_data not in FFpp_pool else 'FaceForensics++_lmdb')
-                self.env = lmdb.open(lmdb_path, create=False, subdir=True, readonly=True, lock=False)
+                # self.env = lmdb.open(lmdb_path, create=False, subdir=True, readonly=True, lock=False)
+                if lmdb_path not in GLOBAL_LMDB_ENVS:
+                    GLOBAL_LMDB_ENVS[lmdb_path] = lmdb.open(lmdb_path, create=False, subdir=True, readonly=True, lock=False)
+                self.env = GLOBAL_LMDB_ENVS[lmdb_path]
         else:
             raise NotImplementedError('Only train and test modes are supported.')
 
@@ -110,6 +133,86 @@ class DeepfakeAbstractBaseDataset(data.Dataset):
         
         self.transform = self.init_data_aug_method()
         
+    def _init_indo_demographic_mapping(self):
+        """
+        Memetakan actor_id (str) -> label suku (int, 0-12).
+ 
+        Membaca dari SEMUA tiga JSON (Indo-MM, Indo-FS, Indo-VC). 
+        Hanya membaca real video karena hanya format itu yang 
+        mengandung nama suku secara eksplisit:
+            001_BAL_M_144_REAL  ->  '001': 0   (BAL = 0)
+        """
+        self.indo_demographics = {}
+ 
+        json_folder = self.config['dataset_json_folder']
+        if not os.path.exists(json_folder):
+            json_folder = json_folder.replace(
+                '/Youtu_Pangu_Security_Public', '/Youtu_Pangu_Security/public'
+            )
+ 
+        for ds_name in ['Indo-MM', 'Indo-FS', 'Indo-VC']:
+            json_path = os.path.join(json_folder, f'{ds_name}.json')
+            if not os.path.exists(json_path):
+                continue
+ 
+            with open(json_path, 'r') as f:
+                data = json.load(f)
+ 
+            try:
+                real_data = data[ds_name]['Indo-real']
+                for mode_key in real_data:            # train, val, test
+                    for comp in real_data[mode_key]:  # 720p, 144p
+                        for vid_name in real_data[mode_key][comp]:
+                            # Format: 001_BAL_M_144_REAL
+                            parts = vid_name.split('_')
+                            if len(parts) >= 2 and parts[1] in SUKU_DICT:
+                                actor_id = parts[0]
+                                self.indo_demographics[actor_id] = SUKU_DICT[parts[1]]
+            except (KeyError, TypeError) as e:
+                print(f"[WARNING] _init_indo_demographic_mapping ({ds_name}): {e}")
+ 
+        print(f"[INFO] Indo demographic mapping: {len(self.indo_demographics)} actor IDs dimuat.")
+ 
+    # ==============================================================
+    # Helper untuk ekstrak demographic label
+    # ==============================================================
+    def _get_demographic_label(self, video_name, file_path):
+        """
+        Mengekstrak demographic label (int 0-12) dari nama folder video.
+ 
+        Format yang didukung:
+          Real : 001_BAL_M_144_REAL   -> parts[1] = 'BAL' langsung
+          VC   : 001_BAL_M_144_VC     -> parts[1] = 'BAL' langsung
+          FS   : 001_009_144_FS       -> lookup parts[0] (target ID)
+          MM   : 001_009_144_FS+VC+LS -> lookup parts[0] (target ID)
+ 
+        Konvensi dataset: suku yang dipakai = suku TARGET (parts[0]).
+ 
+        Return: int (0-12), default 0 jika tidak ditemukan.
+        """
+        if 'Indo' not in file_path:
+            return 13
+ 
+        parts = video_name.split('_')
+        if len(parts) < 1:
+            return 13
+ 
+        # Kasus 1: parts[1] adalah kode suku langsung (real & VC)
+        if len(parts) >= 2 and parts[1] in SUKU_DICT:
+            return SUKU_DICT[parts[1]]
+ 
+        # Kasus 2: parts[1] adalah ID source (FS & MM)
+        # Suku diambil dari TARGET ID = parts[0]
+        target_id = parts[0]
+        if target_id in self.indo_demographics:
+            return self.indo_demographics[target_id]
+ 
+        # Fallback: coba source ID = parts[1]
+        if len(parts) >= 2 and parts[1] in self.indo_demographics:
+            return self.indo_demographics[parts[1]]
+ 
+        return 13
+            
     def init_data_aug_method(self):
         trans = A.Compose([           
             A.HorizontalFlip(p=self.config['data_aug']['flip_prob']),
@@ -170,107 +273,100 @@ class DeepfakeAbstractBaseDataset(data.Dataset):
 
         # If JSON file exists, do the following data collection
         # FIXME: ugly, need to be modified here.
-        cp = None
-        if dataset_name == 'FaceForensics++_c40':
-            dataset_name = 'FaceForensics++'
-            cp = 'c40'
-        elif dataset_name == 'FF-DF_c40':
-            dataset_name = 'FF-DF'
-            cp = 'c40'
-        elif dataset_name == 'FF-F2F_c40':
-            dataset_name = 'FF-F2F'
-            cp = 'c40'
-        elif dataset_name == 'FF-FS_c40':
-            dataset_name = 'FF-FS'
-            cp = 'c40'
-        elif dataset_name == 'FF-NT_c40':
-            dataset_name = 'FF-NT'
-            cp = 'c40'
+        target_compressions = self.config.get('compressions', ['c23', 'c40', 'raw', '720p', '144p'])
+
+        NO_COMPRESSION_DATASETS = [
+            'Celeb-DF-v2', 'Celeb-DF-v1', 'DFDC', 'DFDCP', 
+            'DeeperForensics-1.0', 'UADFV'
+        ]
         # Get the information for the current dataset
         for label in dataset_info[dataset_name]:
-            sub_dataset_info = dataset_info[dataset_name][label][self.mode]
-            # Special case for FaceForensics++ and DeepFakeDetection, choose the compression type
-            if cp == None and dataset_name in ['FF-DF', 'FF-F2F', 'FF-FS', 'FF-NT', 'FaceForensics++','DeepFakeDetection','FaceShifter']:
-                sub_dataset_info = sub_dataset_info[self.compression]
-            elif cp == 'c40' and dataset_name in ['FF-DF', 'FF-F2F', 'FF-FS', 'FF-NT', 'FaceForensics++','DeepFakeDetection','FaceShifter']:
-                sub_dataset_info = sub_dataset_info['c40']
+            mode_data = dataset_info[dataset_name][label][self.mode]
+            
+            if dataset_name in NO_COMPRESSION_DATASETS:
+                # Struktur JSON-nya langsung: mode_data = {video_name: video_info}
+                # Tidak ada compression level, bungkus langsung
+                compression_items = [('no_comp', mode_data)]
+            else:
+                # Struktur JSON-nya: mode_data = {comp_level: {video_name: video_info}}
+                compression_items = [
+                    (comp, data) for comp, data in mode_data.items()
+                    if comp in target_compressions
+                ]
+            # Looping untuk mencari folder kompresi (c23, c40, 720p, 144p) di dalam JSON
+            for comp_level, sub_dataset_info in compression_items:
 
-            # Iterate over the videos in the dataset
-            for video_name, video_info in sub_dataset_info.items():
-                # Unique video name
-                unique_video_name = video_info['label'] + '_' + video_name
+                # Iterate over the videos in the dataset
+                for video_name, video_info in sub_dataset_info.items():
+                    # Unique video name (tambahan nama kompresi agar tidak bentrok)
+                    unique_video_name = f"{video_info['label']}_{comp_level}_{video_name}"
 
-                # Get the label and frame paths for the current video
-                if video_info['label'] not in self.config['label_dict']:
-                    raise ValueError(f'Label {video_info["label"]} is not found in the configuration file.')
-                label = self.config['label_dict'][video_info['label']]
-                frame_paths = video_info['frames']
-                # sorted video path to the lists
-                if '\\' in frame_paths[0]:
-                    frame_paths = sorted(frame_paths, key=lambda x: int(x.split('\\')[-1].split('.')[0]))
-                else:
-                    frame_paths = sorted(frame_paths, key=lambda x: int(x.split('/')[-1].split('.')[0]))
-
-                # Consider the case when the actual number of frames (e.g., 270) is larger than the specified (i.e., self.frame_num=32)
-                # In this case, we select self.frame_num frames from the original 270 frames
-                total_frames = len(frame_paths)
-                if self.frame_num < total_frames:
-                    total_frames = self.frame_num
-                    if self.video_level:
-                        # Select clip_size continuous frames
-                        start_frame = random.randint(0, total_frames - self.frame_num) if self.mode == 'train' else 0
-                        frame_paths = frame_paths[start_frame:start_frame + self.frame_num]  # update total_frames
+                    if video_info['label'] not in self.config['label_dict']:
+                        raise ValueError(f'Label {video_info["label"]} is not found in the configuration file.')
+                    
+                    label_idx = self.config['label_dict'][video_info['label']]
+                    frame_paths = video_info['frames']
+                    
+                    # sorted video path to the lists
+                    if '\\' in frame_paths[0]:
+                        frame_paths = sorted(frame_paths, key=lambda x: int(x.split('\\')[-1].split('.')[0]))
                     else:
-                        # Select self.frame_num frames evenly distributed throughout the video
-                        step = total_frames // self.frame_num
-                        frame_paths = [frame_paths[i] for i in range(0, total_frames, step)][:self.frame_num]
+                        frame_paths = sorted(frame_paths, key=lambda x: int(x.split('/')[-1].split('.')[0]))
+                        
+                    total_frames = len(frame_paths)
+                    if self.frame_num < total_frames:
+                        total_frames = self.frame_num
+                        if self.video_level:
+                            # Select clip_size continuous frames
+                            start_frame = random.randint(0, total_frames - self.frame_num) if self.mode == 'train' else 0
+                            frame_paths = frame_paths[start_frame:start_frame + self.frame_num]  # update total_frames
+                        else:
+                            # Select self.frame_num frames evenly distributed throughout the video
+                            step = total_frames // self.frame_num
+                            frame_paths = [frame_paths[i] for i in range(0, total_frames, step)][:self.frame_num]
                 
-                # If video-level methods, crop clips from the selected frames if needed
-                if self.video_level:
-                    if self.clip_size is None:
-                        raise ValueError('clip_size must be specified when video_level is True.')
-                    # Check if the number of total frames is greater than or equal to clip_size
-                    if total_frames >= self.clip_size:
-                        # Initialize an empty list to store the selected continuous frames
-                        selected_clips = []
-
-                        # Calculate the number of clips to select
-                        num_clips = total_frames // self.clip_size
-
-                        if num_clips > 1:
-                            # Calculate the step size between each clip
-                            clip_step = (total_frames - self.clip_size) // (num_clips - 1)
-
-                            # Select clip_size continuous frames from each part of the video
-                            for i in range(num_clips):
-                                # Ensure start_frame + self.clip_size - 1 does not exceed the index of the last frame
-                                start_frame = random.randrange(i * clip_step, min((i + 1) * clip_step, total_frames - self.clip_size + 1)) if self.mode == 'train' else i * clip_step
+                    # If video-level methods, crop clips from the selected frames if needed
+                    if self.video_level:
+                        if self.clip_size is None:
+                            raise ValueError('clip_size must be specified when video_level is True.')
+                        # Check if the number of total frames is greater than or equal to clip_size
+                        if total_frames >= self.clip_size:
+                            # Initialize an empty list to store the selected continuous frames
+                            selected_clips = []
+                            num_clips = total_frames // self.clip_size
+                            if num_clips > 1:
+                                clip_step = (total_frames - self.clip_size) // (num_clips - 1)
+                                for i in range(num_clips):
+                                    start_frame = random.randrange(i * clip_step, min((i + 1) * clip_step, total_frames - self.clip_size + 1)) if self.mode == 'train' else i * clip_step
+                                    continuous_frames = frame_paths[start_frame:start_frame + self.clip_size]
+                                    selected_clips.append(continuous_frames)
+                            else:
+                                start_frame = random.randrange(0, total_frames - self.clip_size + 1) if self.mode == 'train' else 0
                                 continuous_frames = frame_paths[start_frame:start_frame + self.clip_size]
-                                assert len(continuous_frames) == self.clip_size, 'clip_size is not equal to the length of frame_path_list'
                                 selected_clips.append(continuous_frames)
 
+                            label_list.extend([label_idx] * len(selected_clips))
+                            frame_path_list.extend(selected_clips)
+                            video_name_list.extend([unique_video_name] * len(selected_clips))
+
                         else:
-                            start_frame = random.randrange(0, total_frames - self.clip_size + 1) if self.mode == 'train' else 0
-                            continuous_frames = frame_paths[start_frame:start_frame + self.clip_size]
-                            assert len(continuous_frames)==self.clip_size, 'clip_size is not equal to the length of frame_path_list'
+                            selected_clips = []
+                            continuous_frames = frame_paths.copy()
+                            while len(continuous_frames) < self.clip_size:
+                                continuous_frames.append(continuous_frames[-1])
+                            
                             selected_clips.append(continuous_frames)
-
-                        # Append the list of selected clips and append the label
-                        label_list.extend([label] * len(selected_clips))
-                        frame_path_list.extend(selected_clips)
-                        # video name save
-                        video_name_list.extend([unique_video_name] * len(selected_clips))
-
+                            label_list.extend([label_idx] * len(selected_clips))
+                            frame_path_list.extend(selected_clips)
+                            video_name_list.extend([unique_video_name] * len(selected_clips))
+                    
+                    # Otherwise, extend the label and frame paths to the lists according to the number of frames
                     else:
-                        print(f"Skipping video {unique_video_name} because it has less than clip_size ({self.clip_size}) frames ({total_frames}).")
-                
-                # Otherwise, extend the label and frame paths to the lists according to the number of frames
-                else:
-                    # Extend the label and frame paths to the lists according to the number of frames
-                    label_list.extend([label] * total_frames)
-                    frame_path_list.extend(frame_paths)
-                    # video name save
-                    video_name_list.extend([unique_video_name] * len(frame_paths))
+                        # Extend the label and frame paths to the lists according to the number of frames
+                        label_list.extend([label_idx] * total_frames)
+                        frame_path_list.extend(frame_paths)
+                        # video name save
+                        video_name_list.extend([unique_video_name] * len(frame_paths))
             
         # Shuffle the label and frame path lists in the same order
         shuffled = list(zip(label_list, frame_path_list, video_name_list))
@@ -295,21 +391,40 @@ class DeepfakeAbstractBaseDataset(data.Dataset):
         """
         size = self.config['resolution'] # if self.mode == "train" else self.config['resolution']
         if not self.lmdb:
-            if not file_path[0] == '.':
-                file_path =  f'./{self.config["rgb_dir"]}\\'+file_path
+            if not file_path.startswith('.') and not file_path.startswith('/'):
+                file_path = os.path.join(self.config["rgb_dir"], file_path)
+            
             assert os.path.exists(file_path), f"{file_path} does not exist"
             img = cv2.imread(file_path)
             if img is None:
                 raise ValueError('Loaded image is None: {}'.format(file_path))
         elif self.lmdb:
             with self.env.begin(write=False) as txn:
-                # transfer the path format from rgb-path to lmdb-key
-                if file_path[0]=='.':
-                    file_path=file_path.replace('./datasets\\','')
+                clean_path = file_path
+                marker = "datasets/rgb/"
+                if marker in clean_path:
+                    clean_path = clean_path[clean_path.find(marker) + len(marker):]
+                elif clean_path.startswith('./datasets\\'):
+                    clean_path = clean_path.replace('./datasets\\', '')
+                elif clean_path.startswith('./datasets/'):
+                    clean_path = clean_path.replace('./datasets/', '')
+                
+                # Standarkan semua slash jadi forward slash
+                clean_path = clean_path.replace('\\', '/')
+                # Ganti hanya slash pertama jadi backslash (sesuai format dataset2lmdb)
+                lmdb_key = clean_path.replace('/', '\\', 1)
+                # -------------------------------
 
-                image_bin = txn.get(file_path.encode())
+                image_bin = txn.get(lmdb_key.encode('utf-8'))
+                if image_bin is None:
+                    print(f"\n[FATAL ERROR] GAMBAR TIDAK DITEMUKAN DI LMDB!")
+                    print(f"Path dari JSON  : {file_path}")
+                    print(f"Key yg dicari   : {lmdb_key}")
+                    import sys; sys.exit(1)
+                
                 image_buf = np.frombuffer(image_bin, dtype=np.uint8)
                 img = cv2.imdecode(image_buf, cv2.IMREAD_COLOR)
+                
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         img = cv2.resize(img, (size, size), interpolation=cv2.INTER_CUBIC)
         return Image.fromarray(np.array(img, dtype=np.uint8))
@@ -373,8 +488,9 @@ class DeepfakeAbstractBaseDataset(data.Dataset):
         if file_path is None:
             return np.zeros((81, 2))
         if not self.lmdb:
-            if not file_path[0] == '.':
-                file_path =  f'./{self.config["rgb_dir"]}\\'+file_path
+            if not file_path.startswith('.') and not file_path.startswith('/'):
+                file_path = os.path.join(self.config["rgb_dir"], file_path)
+                
             if os.path.exists(file_path):
                 landmark = np.load(file_path)
             else:
@@ -388,6 +504,42 @@ class DeepfakeAbstractBaseDataset(data.Dataset):
                 landmark = np.frombuffer(binary, dtype=np.uint32).reshape((81, 2))
                 landmark=self.rescale_landmarks(np.float32(landmark), original_size=256, new_size=self.config['resolution'])
         return landmark
+
+    def load_audio(self, image_path):
+        """Memuat file .wav dari direktori audios dan mengonversi ke Mel-Spectrogram."""
+        folder_video_path = os.path.dirname(image_path)
+        video_name = os.path.basename(folder_video_path)
+        base_dir = os.path.dirname(folder_video_path).replace('frames', 'audios')
+        audio_path = os.path.join(base_dir, f"{video_name}.wav")
+
+        n_mels = self.config.get('audio_config', {}).get('n_mels', 128)
+        target_length = self.config.get('audio_config', {}).get('target_length', 256)
+        sample_rate = self.config.get('audio_config', {}).get('sample_rate', 16000)
+
+        # Jika audio gagal diekstrak / tidak ada, kembalikan tensor nol
+        if not os.path.exists(audio_path):
+            return torch.zeros((1, n_mels, target_length))
+
+        try:
+            waveform, sample_rate = torchaudio.load(audio_path)
+            # Konversi ke Mel-Spectrogram
+            mel_spec = TA_transforms.MelSpectrogram(
+                sample_rate=sample_rate, n_mels=n_mels, n_fft=1024, hop_length=512
+            )(waveform)
+            # Ubah ke skala Logaritma (Decibel) agar polanya lebih jelas
+            mel_spec = TA_transforms.AmplitudeToDB()(mel_spec)
+
+            # Samakan panjang waktu (padding/truncating) agar bisa di-batch
+            if mel_spec.shape[-1] > target_length:
+                mel_spec = mel_spec[..., :target_length]
+            else:
+                pad_amount = target_length - mel_spec.shape[-1]
+                mel_spec = torch.nn.functional.pad(mel_spec, (0, pad_amount))
+            return mel_spec # Output: [1, 128, 256]
+            
+        except Exception as e:
+            print(f"Error loading audio {audio_path}: {e}")
+            return torch.zeros((1, n_mels, target_length))
 
     def to_tensor(self, img):
         """
@@ -471,6 +623,8 @@ class DeepfakeAbstractBaseDataset(data.Dataset):
         if not isinstance(image_paths, list):
             image_paths = [image_paths]  # for the image-level IO, only one frame is used
 
+        image_paths = [p.replace('\\', '/') for p in image_paths]
+        
         image_tensors = []
         landmark_tensors = []
         mask_tensors = []
@@ -523,25 +677,33 @@ class DeepfakeAbstractBaseDataset(data.Dataset):
             landmark_tensors.append(landmarks_trans)
             mask_tensors.append(mask_trans)
 
+
+        first_img_path = image_paths[0] if isinstance(image_paths, list) else image_paths
+        if '\\' in first_img_path:
+            video_name = first_img_path.split('\\')[-2]
+        else:
+            video_name = first_img_path.split('/')[-2]
+        
+        # Default label jika format tidak sesuai (misal untuk dataset FF++)
+        demographic_label = self._get_demographic_label(video_name, first_img_path)
+ 
         if self.video_level:
-            # Stack image tensors along a new dimension (time)
             image_tensors = torch.stack(image_tensors, dim=0)
-            # Stack landmark and mask tensors along a new dimension (time)
-            if not any(landmark is None or (isinstance(landmark, list) and None in landmark) for landmark in landmark_tensors):
+            if not any(lm is None or (isinstance(lm, list) and None in lm) for lm in landmark_tensors):
                 landmark_tensors = torch.stack(landmark_tensors, dim=0)
             if not any(m is None or (isinstance(m, list) and None in m) for m in mask_tensors):
                 mask_tensors = torch.stack(mask_tensors, dim=0)
         else:
-            # Get the first image tensor
             image_tensors = image_tensors[0]
-            # Get the first landmark and mask tensors
-            if not any(landmark is None or (isinstance(landmark, list) and None in landmark) for landmark in landmark_tensors):
+            if not any(lm is None or (isinstance(lm, list) and None in lm) for lm in landmark_tensors):
                 landmark_tensors = landmark_tensors[0]
             if not any(m is None or (isinstance(m, list) and None in m) for m in mask_tensors):
                 mask_tensors = mask_tensors[0]
+ 
+        audio_tensor = self.load_audio(first_img_path) if self.config.get('with_audio', False) else None
+ 
+        return image_tensors, label, landmark_tensors, mask_tensors, demographic_label, audio_tensor
 
-        return image_tensors, label, landmark_tensors, mask_tensors
-    
     @staticmethod
     def collate_fn(batch):
         """
@@ -556,12 +718,17 @@ class DeepfakeAbstractBaseDataset(data.Dataset):
             and the mask tensor.
         """
         # Separate the image, label, landmark, and mask tensors
-        images, labels, landmarks, masks = zip(*batch)
+        images, labels, landmarks, masks, demographics, audios = zip(*batch)
         
         # Stack the image, label, landmark, and mask tensors
         images = torch.stack(images, dim=0)
         labels = torch.LongTensor(labels)
-        
+        demographics = torch.LongTensor(demographics)
+        if not any(a is None for a in audios):
+            audios = torch.stack(audios, dim=0) # [B, 1, 128, 256]
+        else:
+            audios = None
+
         # Special case for landmarks and masks if they are None
         if not any(landmark is None or (isinstance(landmark, list) and None in landmark) for landmark in landmarks):
             landmarks = torch.stack(landmarks, dim=0)
@@ -579,6 +746,8 @@ class DeepfakeAbstractBaseDataset(data.Dataset):
         data_dict['label'] = labels
         data_dict['landmark'] = landmarks
         data_dict['mask'] = masks
+        data_dict['demographic_label'] = demographics
+        data_dict['audio'] = audios
         return data_dict
 
     def __len__(self):

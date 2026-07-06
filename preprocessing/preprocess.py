@@ -1,3 +1,4 @@
+# preprocess.py
 # author: Zhiyuan Yan
 # email: zhiyuanyan@link.cuhk.edu.cn
 # date: 2023-03-29
@@ -65,6 +66,7 @@ import datetime
 import glob
 import concurrent.futures
 import numpy as np
+import subprocess
 from tqdm import tqdm
 from pathlib import Path
 from imutils import face_utils
@@ -319,19 +321,57 @@ def video_manipulate(
                 continue
 
             # Save cropped face, landmarks, and visualization image
-            save_path_ = save_path / 'frames' / org_path.stem
-            save_path_.mkdir(parents=True, exist_ok=True)
+            # save_path_ = save_path / 'frames' / org_path.stem
+            # save_path_.mkdir(parents=True, exist_ok=True)
+
+            # # Save cropped face
+            # image_path = save_path_ / f"{cnt_frame:03d}.png"
+            # if not image_path.is_file():
+            #     cv2.imwrite(str(image_path), cropped_face)
+
+            # # Save landmarks
+            # land_path = save_path / 'landmarks' / org_path.stem / f"{cnt_frame:03d}.npy"
+            # os.makedirs(os.path.dirname(land_path), exist_ok=True)
+            # np.save(str(land_path), landmarks)
+
+            path_str = org_path.parent.as_posix()
+            
+            frames_dir_str = path_str.replace('/videos', '/frames')
+            landmarks_dir_str = path_str.replace('/videos', '/landmarks')
+            # audios_dir_str = path_str.replace('/videos', '/audios')
+
+            # Path akhir untuk folder video ini
+            save_path_frames = Path(frames_dir_str) / org_path.stem
+            save_path_frames.mkdir(parents=True, exist_ok=True)
+
+            # if cnt_frame == frame_idxs[0]:
+            #     Path(audios_dir_str).mkdir(parents=True, exist_ok=True)
+            #     audio_save_path = Path(audios_dir_str) / f"{org_path.stem}.wav"
+
+            #     if not audio_save_path.is_file():
+            #         # Command: ffmpeg -i input.mp4 -vn -acodec pcm_s16le -ar 16000 -ac 1 output.wav
+            #         # -vn: tanpa video, -ar 16000: sample rate 16kHz, -ac 1: mono (1 channel)
+            #         command = [
+            #             'ffmpeg', '-i', str(org_path),
+            #             '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
+            #             str(audio_save_path),
+            #             '-loglevel', 'error', '-y'
+            #         ]
+            #         try:
+            #             subprocess.run(command, check=True)
+            #         except subprocess.CalledProcessError:
+            #             logger.warning(f"Gagal ekstrak audio dari {org_path.name}. Video mungkin tidak bersuara.")
 
             # Save cropped face
-            image_path = save_path_ / f"{cnt_frame:03d}.png"
+            image_path = save_path_frames / f"{cnt_frame:03d}.png"
             if not image_path.is_file():
                 cv2.imwrite(str(image_path), cropped_face)
 
             # Save landmarks
-            land_path = save_path / 'landmarks' / org_path.stem / f"{cnt_frame:03d}.npy"
+            land_path = Path(landmarks_dir_str) / org_path.stem / f"{cnt_frame:03d}.npy"
             os.makedirs(os.path.dirname(land_path), exist_ok=True)
             np.save(str(land_path), landmarks)
-
+            
             # Save mask
             if mask_path is not None:
                 mask_path = save_path / 'masks' / org_path.stem / f"{cnt_frame:03d}.png"
@@ -377,6 +417,31 @@ def preprocess(dataset_path, mask_path, mode, num_frames, stride, logger):
     with concurrent.futures.ThreadPoolExecutor(max_workers=num_processes) as executor:
         futures = []
         for movie_path in movies_path_list:
+            path_str = movie_path.parent.as_posix()
+            audios_dir_str = path_str.replace('/videos', '/audios')
+            Path(audios_dir_str).mkdir(parents=True, exist_ok=True)
+            audio_save_path = Path(audios_dir_str) / f"{movie_path.stem}.wav"
+
+            if not audio_save_path.is_file():
+                command = [
+                    'ffmpeg', '-i', str(movie_path),
+                    '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
+                    str(audio_save_path),
+                    '-loglevel', 'error', '-y'
+                ]
+                try:
+                    subprocess.run(command, check=True)
+                except subprocess.CalledProcessError:
+                    logger.warning(f"Gagal ekstrak audio dari {movie_path.name}")
+                    
+            frames_dir_str = path_str.replace('/videos', '/frames')
+            save_path_frames = Path(frames_dir_str) / movie_path.stem
+            
+            # Cek apakah folder frames untuk video ini sudah ada dan isinya tidak kosong
+            if save_path_frames.exists() and any(save_path_frames.iterdir()):
+                logger.info(f"Video {movie_path.name} sudah diproses. Melompati...")
+                continue
+                
             # Check if there is a mask for the video
             if mask_path is not None:
                 if movie_path.stem not in [path.stem for path in masks_path_list]:
@@ -451,6 +516,22 @@ if __name__ == '__main__':
                             "manipulated_sequences/DeepFakeDetection"]
         # mask_dataset_names = []
         mask_dataset_paths = [Path(os.path.join(dataset_path, name)) for name in mask_dataset_names]
+    # IndoDeepfake_Dataset
+    elif dataset_name == 'IndoDeepfake_Dataset':
+        sub_dataset_paths = [
+            Path(os.path.join(dataset_path, "original_sequences")),
+            Path(os.path.join(dataset_path, "manipulated_sequences"))
+        ]
+        # Tidak ada mask, bypass
+        mask_dataset_paths = []
+    
+    elif dataset_name == 'TA_Testing':
+        sub_dataset_paths = [
+            Path(os.path.join(dataset_path, "original_sequences")),
+            Path(os.path.join(dataset_path, "manipulated_sequences"))
+        ]
+        mask_dataset_paths = []
+
     ## Celeb-DF-v1
     elif dataset_name == 'Celeb-DF-v1':
         sub_dataset_names = ['Celeb-real', 'Celeb-synthesis', 'YouTube-real']

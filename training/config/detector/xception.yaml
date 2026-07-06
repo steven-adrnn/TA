@@ -14,15 +14,16 @@ backbone_config:
   dropout: false
 
 # dataset
-all_dataset: [FaceForensics++, FF-F2F, FF-DF, FF-FS, FF-NT, FaceShifter, DeepFakeDetection, Celeb-DF-v1, Celeb-DF-v2, DFDCP, DFDC, DeeperForensics-1.0, UADFV]
-train_dataset: [FaceForensics++]
-test_dataset: [FaceForensics++, DeepFakeDetection]
+all_dataset: [FaceForensics++, FF-F2F, FF-DF, FF-FS, FF-NT, FF-FH, FaceShifter, DeepFakeDetection, Celeb-DF-v1, Celeb-DF-v2, DFDCP, DFDC, DeeperForensics-1.0, UADFV, IndoDeepfake, Indo-MM, Indo-FS, Indo-VC, TA-FS, TA-VC, TA-MM]
+train_dataset: [Indo-MM, Indo-FS, Indo-VC, FF-F2F, FF-DF, FF-FS, FF-NT, FF-FH]
+test_dataset: [Indo-MM, Indo-FS, Indo-VC]
 
-compression: c23  # compression-level for videos
-train_batchSize: 32   # training batch size
+compressions: ['720p']
+use_balanced_sampler: true
+train_batchSize: 16   # training batch size
 test_batchSize: 32   # test batch size
 workers: 8   # number of data loading workers
-frame_num: {'train': 32, 'test': 32}   # number of frames to use per video in training and testing
+frame_num: {'train': 24, 'test': 24}   # number of frames to use per video in training and testing
 resolution: 256   # resolution of output image to network
 with_mask: false   # whether to include mask information in the input
 with_landmark: false   # whether to include facial landmark information in the input
@@ -64,7 +65,7 @@ optimizer:
 
 # training config
 lr_scheduler: null   # learning rate scheduler
-nEpochs: 10   # number of epochs to train for
+nEpochs: 25   # number of epochs to train for
 start_epoch: 0   # manual epoch number (useful for restarts)
 save_epoch: 1   # interval epochs for saving models
 rec_iter: 100   # interval iterations for recording

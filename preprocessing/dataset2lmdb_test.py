@@ -73,7 +73,7 @@ args = parser.parse_args()
 
 if __name__ == '__main__':
     # from config.yaml load parameters
-    yaml_path = './preprocessing/config.yaml'
+    yaml_path = './config.yaml'
     # open the yaml file
     try:
         with open(yaml_path, 'r') as f:

@@ -1,5 +1,5 @@
 mode: train
-lmdb: True
+lmdb: False
 dry_run: false
 rgb_dir: './datasets/rgb'
 lmdb_dir:  './datasets/lmdb'
@@ -41,3 +41,8 @@ label_dict:
   # Roop
   roop_Real: 0
   roop_Fake: 1
+  # IndoDeepfake_Dataset
+  Indo-real: 0
+  Indo-MM: 1
+  Indo-FS: 1
+  Indo-VC: 1

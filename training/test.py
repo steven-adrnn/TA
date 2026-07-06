@@ -1,3 +1,4 @@
+# test.py
 """
 eval pretained model.
 """
@@ -95,15 +96,14 @@ def test_one_dataset(model, data_loader):
     label_lists = []
     for i, data_dict in tqdm(enumerate(data_loader), total=len(data_loader)):
         # get data
-        data, label, mask, landmark = \
-        data_dict['image'], data_dict['label'], data_dict['mask'], data_dict['landmark']
-        label = torch.where(data_dict['label'] != 0, 1, 0)
-        # move data to GPU
-        data_dict['image'], data_dict['label'] = data.to(device), label.to(device)
-        if mask is not None:
-            data_dict['mask'] = mask.to(device)
-        if landmark is not None:
-            data_dict['landmark'] = landmark.to(device)
+        if 'label_spe' in data_dict:
+            data_dict.pop('label_spe') 
+        data_dict['label'] = torch.where(data_dict['label'] != 0, 1, 0)
+        
+        # Move data to GPU
+        for key in data_dict.keys():
+            if data_dict[key] is not None and key != 'name':
+                data_dict[key] = data_dict[key].to(device)
 
         # model forward without considering gradient computation
         predictions = inference(model, data_dict)
@@ -129,7 +129,8 @@ def test_epoch(model, test_data_loaders):
         
         # compute metric for each dataset
         metric_one_dataset = get_test_metrics(y_pred=predictions_nps, y_true=label_nps,
-                                              img_names=data_dict['image'])
+                                              img_names=data_dict['image'],
+                                              dataset_name=key)
         metrics_all_datasets[key] = metric_one_dataset
         
         # info for each dataset
@@ -188,6 +189,7 @@ def main():
         print('Fail to load the pre-trained weights')
     
     # start testing
+    model.epoch = model.stage1_epochs + 100 if hasattr(model, 'stage1_epochs') else 999 
     best_metric = test_epoch(model, test_data_loaders)
     print('===> Test Done!')
 
